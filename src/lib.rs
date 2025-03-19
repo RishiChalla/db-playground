@@ -1,8 +1,6 @@
-mod b_plus_tree_db;
+mod btree;
 
 pub trait Database<Key, Record> {
-    fn new() -> Self;
-
     type InsertionError;
     fn insert_record(&mut self, key: Key, record: Record) -> Result<(), Self::InsertionError>;
     

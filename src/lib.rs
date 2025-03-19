@@ -1,4 +1,4 @@
-mod btree;
+pub mod btree;
 
 pub trait Database<Key, Record> {
     type InsertionError;

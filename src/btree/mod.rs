@@ -1,13 +1,68 @@
-use std::{cell::RefCell, fs::{File, OpenOptions}, io::{self, BufReader, BufWriter, Seek, SeekFrom, Write}, num::NonZeroUsize, path::Path};
+use std::{
+    cell::RefCell, fmt::Debug, fs::{File, OpenOptions}, io::{self, BufReader, BufWriter, Seek, SeekFrom, Write}, num::NonZeroUsize, ops::Deref, path::Path
+};
 
-use bincode::{config, decode_from_reader, encode_to_vec, error::{DecodeError, EncodeError}, Decode, Encode};
+use bincode::{
+    config::{self, Configuration, LittleEndian, Fixint, Limit},
+    decode_from_reader,
+    encode_to_vec,
+    error::{DecodeError, EncodeError},
+    Decode,
+    Encode,
+    de::{read::Reader, Decoder},
+    enc::{write::Writer, Encoder},
+};
 use lru::LruCache;
+use arrayvec::ArrayString;
+
+/// A marker trait for an Indexable Key that can be used as a key for the B+ Tree Index.
+trait IndexKey: Debug + Ord + Encode + Decode<()> + Clone {}
+impl<Key: Debug + Ord + Encode + Decode<()> + Clone> IndexKey for Key {}
+
+/// A String can be used as a key for indexing the B+ Tree, but it must have a max-length.
+/// This uses ArrayString from the arrayvec crate to provide a viable string key.
+#[derive(Debug, PartialEq, Eq, PartialOrd, Ord, Clone)]
+struct StringKey<const MAX_SIZE: usize>(ArrayString::<MAX_SIZE>);
+
+impl<const MAX_SIZE: usize> Deref for StringKey<MAX_SIZE> {
+    type Target = ArrayString<MAX_SIZE>;
+
+    fn deref(&self) -> &Self::Target {
+        &self.0
+    }
+}
+
+impl<'a, const MAX_SIZE: usize> TryFrom<&'a str> for StringKey<MAX_SIZE> {
+    type Error = <&'a str as TryInto<ArrayString<MAX_SIZE>>>::Error;
+    
+    fn try_from(value: &'a str) -> Result<Self, Self::Error> {
+        Ok(Self(ArrayString::try_from(value)?))
+    }
+}
+
+impl<const MAX_SIZE: usize> Encode for StringKey<MAX_SIZE> {
+    fn encode<E: Encoder>(&self, encoder: &mut E) -> Result<(), EncodeError> {
+        (self.0.len() as u32).encode(encoder)?;
+        encoder.writer().write(self.0.as_bytes())
+    }
+}
+
+impl<const MAX_SIZE: usize> Decode<()> for StringKey<MAX_SIZE> {
+    fn decode<D: Decoder<Context = ()>>(decoder: &mut D) -> Result<Self, DecodeError> {
+        let len = u32::decode(decoder)?;
+        let mut bytes: [u8; MAX_SIZE] = [0; MAX_SIZE];
+        decoder.reader().read(&mut bytes)?;
+        let mut string = ArrayString::from_byte_string(&bytes).map_err(|inner| DecodeError::Utf8 { inner })?;
+        string.truncate(len as usize);
+        Ok(Self(string))
+    }
+}
 
 /// The size of a single page (data blob section in the B-Tree Index file)
-const PAGE_SIZE: usize = 4000;
+const PAGE_SIZE: usize = 2 << 11;
 
-/// The size of the LRU cache, we hardcode this to take up 4gb of Heap RAM of pages.
-const LRU_CACHE_SIZE: usize = 4_000_000_000 / PAGE_SIZE;
+/// The size of the LRU cache, we hardcode this to take up 4mb of Heap RAM of pages.
+const LRU_CACHE_SIZE: usize = (2 << 21) / PAGE_SIZE;
 
 /// The offset number of pages, to reach a given page, this uniquely identified every tree node.
 #[derive(Debug, Hash, PartialEq, Eq, PartialOrd, Ord, Encode, Decode, Clone, Copy)]
@@ -35,8 +90,8 @@ enum TreeNodeVariant {
 
 /// Contains a node of the B+ Tree. This contains actual data, including splitting factors and/or leaves and record locations.
 /// This is a dense data format, and is cached by LRU, and indexed by PageOffset.
-#[derive(Debug, Encode, Decode, Clone)]
-struct TreeNode<Key: Ord + Encode + Decode<()> + Clone> {
+#[derive(Debug, Encode, Decode, Clone, PartialEq, Eq)]
+struct TreeNode<Key: IndexKey> {
     /// The offset of the page, in the index file containing the B+ Tree
     offset: PageOffset,
     /// A pointer to the left node, useful for traversing the B+ Tree sequentially.
@@ -58,7 +113,7 @@ struct TreeNode<Key: Ord + Encode + Decode<()> + Clone> {
     variant: TreeNodeVariant,
 }
 
-impl<Key: Ord + Encode + Decode<()> + Clone> Default for TreeNode<Key> {
+impl<Key: IndexKey> Default for TreeNode<Key> {
     fn default() -> Self {
         Self {
             offset: PageOffset(0),
@@ -71,7 +126,7 @@ impl<Key: Ord + Encode + Decode<()> + Clone> Default for TreeNode<Key> {
     }
 }
 
-impl<Key: Ord + Encode + Decode<()> + Clone> TreeNode<Key> {
+impl<Key: IndexKey> TreeNode<Key> {
     /// Retrieves the maximum number of splits in a single tree node.
     /// This is determined by the size of the Keys, relative to the size of a page.
     const fn max_splits() -> usize {
@@ -91,15 +146,8 @@ impl<Key: Ord + Encode + Decode<()> + Clone> TreeNode<Key> {
         // Use binary search to find the partition point
         let partition = self.partition_point(key);
 
-        // Check if the key already exists.
-        if self.splits[partition - 1].0 == *key {
-            return Err(IndexingError::InsertionAlreadyExists);
-        }
-
-        // Insert at the partition point to retain sorted order.
-        self.splits.insert(partition, (key.clone(), child));
-
         // The new key was smaller than everything in the node. This means we need to traverse upwards and update all parent pointers.
+        // If partition is 0, we're also guaranteed the key doesn't exist, since it was smaller than everything we already have.
         if partition == 0 {
             let mut parent = self.parent;
             while let Some(offset) = parent {
@@ -108,7 +156,12 @@ impl<Key: Ord + Encode + Decode<()> + Clone> TreeNode<Key> {
                 parent = node.parent;
                 mutated_nodes.push(node); // Mark the parent as mutated.
             }
+        } else if self.splits[partition - 1].0 == *key { // Check if the key already exists.
+            return Err(IndexingError::InsertionAlreadyExists);
         }
+
+        // Insert at the partition point to retain sorted order.
+        self.splits.insert(partition, (key.clone(), child));
 
         // The node has no space left, we need to split the node apart.
         if self.splits.len() > Self::max_splits() {
@@ -157,7 +210,7 @@ impl<Key: Ord + Encode + Decode<()> + Clone> TreeNode<Key> {
 /// The Tree is held on disk, in an indexing file, and pages of it is read to RAM when needed on lookups. Lookups or insertions yield a relevant
 /// Record Row, which both uniquely identifies database records, and provides random access.
 #[derive(Debug)]
-struct BPlusTree<Key: Ord + Encode + Decode<()> + Clone> {
+struct BPlusTree<Key: IndexKey> {
     /// The cache containing node pages in memory. If a tree node is not present in this cache, it must be loaded from disk, and will replace
     /// the most unused node from this cache.
     node_cache: RefCell<LruCache<PageOffset, TreeNode<Key>>>,
@@ -168,7 +221,7 @@ struct BPlusTree<Key: Ord + Encode + Decode<()> + Clone> {
 }
 
 /// Contains the interior data of the B+ Tree. All interior data must be loaded and synchronized with the disk-saved B+ Tree.
-#[derive(Debug, Default, Encode, Decode, Clone)]
+#[derive(Debug, Default, Encode, Decode, Clone, PartialEq, Eq)]
 struct BPlusTreeInner {
     /// The root node of the B+ Tree
     root: Option<PageOffset>,
@@ -203,11 +256,14 @@ pub enum IndexingError {
     MetadataOverwrite,
     /// Occurs when attempting to insert onto a key that already exists.
     InsertionAlreadyExists,
+    /// Occurs when attempting to write data larger than a page.
+    WritePageOverflow,
 }
 
-impl<Key: Ord + Encode + Decode<()> + Clone> BPlusTree<Key> {
+impl<Key: IndexKey> BPlusTree<Key> {
     /// Loads the B+ Tree from an index file path.
-    fn load(index_file_path: String) -> Result<Self, IndexingError> {
+    fn load<Str: Into<String>>(index_file_path: Str) -> Result<Self, IndexingError> {
+        let index_file_path: String = index_file_path.into();
         // Create a new LRU cache with the given cache size.
         let node_cache = RefCell::new(LruCache::new(NonZeroUsize::new(LRU_CACHE_SIZE).unwrap()));
         // If the file already exists, we're loading it, otherwise we're creating a new file.
@@ -260,7 +316,7 @@ impl<Key: Ord + Encode + Decode<()> + Clone> BPlusTree<Key> {
             if node.offset < inner_checkpoint.next_page {
                 node_checkpoints.push(node.offset.load_node(self)?);
             }
-            node.offset.write_page(&mut self.index_file, &node)
+            node.offset.write_page(&mut self.index_file, node)
         });
 
         // A write was unsuccessful, we need to revert all previously written pages.
@@ -365,22 +421,36 @@ impl<Key: Ord + Encode + Decode<()> + Clone> BPlusTree<Key> {
 }
 
 impl PageOffset {
+
     /// Gets the hardcoded page offset for the inner Tree metadata.
     const fn inner() -> Self { Self(0) }
 
+    /// Config used for serialization to binary with bincode.
+    const fn bincode_config() -> Configuration<LittleEndian, Fixint, Limit<PAGE_SIZE>> {
+        config::standard()
+            .with_fixed_int_encoding()
+            .with_limit::<PAGE_SIZE>()
+    }
+
     /// Writes a single page of data into the B-Tree Index File.
-    fn write_page<Data: Encode>(&self, index_file: &mut File, data: &Data) -> Result<(), IndexingError> {
+    fn write_page<Data: Encode + Decode<()> + Eq + Debug>(&self, index_file: &mut File, data: &Data) -> Result<(), IndexingError> {
         // Create a writer and set its position to the page
         let mut writer = BufWriter::new(&mut *index_file);
         writer.seek(SeekFrom::Start((self.0 * PAGE_SIZE) as u64)).map_err(IndexingError::Io)?;
         // Create and populate a buffer with the serialized data, padded with 0s up to the page size.
-        let mut buffer = encode_to_vec(data, config::standard()).map_err(IndexingError::Serialization)?;
+        let mut buffer = encode_to_vec(data, Self::bincode_config()).map_err(IndexingError::Serialization)?;
+        if buffer.len() > PAGE_SIZE { return Err(IndexingError::WritePageOverflow); }
         buffer.resize(PAGE_SIZE, 0);
         // Write the buffer to the writer, and flush it.
         writer.write_all(&buffer).map_err(IndexingError::Io)?;
         writer.flush().map_err(IndexingError::Io)?;
         drop(writer);
         index_file.sync_data().map_err(IndexingError::Io)?;
+
+        // Debug Only - Assert the page we just wrote to is actually equal to the data we wrote, when read.
+        // TODO - Get rid of this (this is just for testing string keys.)
+        // debug_assert_eq!(*data, self.read_page(index_file).unwrap());
+
         Ok(())
     }
     
@@ -390,13 +460,12 @@ impl PageOffset {
         let mut reader = BufReader::new(index_file);
         reader.seek(SeekFrom::Start((self.0 * PAGE_SIZE) as u64)).map_err(IndexingError::Io)?;
         // Deserialize the page and save it.
-        let data = decode_from_reader(reader, config::standard()).map_err(IndexingError::Deserialization)?;
+        let data = decode_from_reader(reader, Self::bincode_config()).map_err(IndexingError::Deserialization)?;
         Ok(data)
     }
 
     /// Attempts to load a node, using the LRU Caching strategy. If the node is not present in cache, it is retrieved from disk, and cached for future use.
-    fn load_node<Key>(&self, tree: &BPlusTree<Key>) -> Result<TreeNode<Key>, IndexingError>
-    where Key: Ord + Encode + Decode<()> + Clone {
+    fn load_node<Key: IndexKey>(&self, tree: &BPlusTree<Key>) -> Result<TreeNode<Key>, IndexingError> {
         if *self == Self::inner() { return Err(IndexingError::MetadataOverwrite); }
         let mut node_cache = tree.node_cache.borrow_mut();
         if let Some(node) = node_cache.get(self) {
@@ -412,7 +481,8 @@ impl PageOffset {
 #[cfg(test)]
 mod test {
     use std::{fs::{create_dir, remove_file}, io::{self, ErrorKind}, path::Path};
-    use super::{BPlusTree, RecordRow};
+    use bincode::{decode_from_slice, encode_to_vec};
+    use super::{BPlusTree, PageOffset, RecordRow, StringKey, TreeNode, IndexingError};
 
     /// Resets the DB file, and creates a folder if necessary.
     fn reset_db_file(path: &'static str) -> Result<(), io::Error> {
@@ -429,23 +499,97 @@ mod test {
         Ok(())
     }
 
-    /// Tests that the B+ Tree data is persisted in the DB file.
+    /// Tests that the B+ Tree correctly handles overwriting attempts.
     #[test]
-    fn test_btree_persistence() {
-        reset_db_file("test_database").expect("Existing DB file must be cleared");
+    fn test_btree_overwrite() {
+        reset_db_file("overwrite").expect("Existing DB file must be cleared");
 
-        // Create empty B-Tree (ensure it is empty)
-        let mut btree: BPlusTree<i32> = BPlusTree::load(String::from("test-data/test_database")).unwrap();
-        assert_eq!(btree.lookup(&10).unwrap(), None);
-        btree.insert(&10, RecordRow(3)).unwrap();
-        assert_eq!(btree.lookup(&10).unwrap(), Some(RecordRow(3)));
+        let mut btree: BPlusTree<usize> = BPlusTree::load("test-data/overwrite").unwrap();
+        btree.insert(&10, RecordRow(10)).unwrap();
+        assert!(btree.insert(&10, RecordRow(20)).is_err_and(|err| matches!(err, IndexingError::InsertionAlreadyExists)));
+        btree.insert(&5, RecordRow(20)).unwrap();
+        assert!(btree.insert(&5, RecordRow(15)).is_err_and(|err| matches!(err, IndexingError::InsertionAlreadyExists)));
+        assert!(btree.insert(&10, RecordRow(40)).is_err_and(|err| matches!(err, IndexingError::InsertionAlreadyExists)));
+        btree.insert(&7, RecordRow(30)).unwrap();
+    }
+
+    /// Tests that the B+ Tree data splits correctly when inserting.
+    #[test]
+    fn test_btree_insertion_split() {
+        reset_db_file("insertion-split").expect("Existing DB file must be cleared");
+
+        // Create an empty B+ Tree and query its max splits per node.
+        // max_splits ^ 2 will be guaranteed to have at least 2 levels, and will most likely have 3.
+        let mut btree: BPlusTree<usize> = BPlusTree::load("test-data/insertion-split").unwrap();
+        let num_items = TreeNode::<usize>::max_splits() * TreeNode::<usize>::max_splits();
+
+        println!("Testing {} insertions.", num_items);
+
+        // Insert all items into the B+ Tree.
+        (0..num_items).try_for_each(|record| {
+            btree.insert(&record, RecordRow(record))
+        }).expect("Should be able to insert all keys.");
+
+        // Assert that all added items are present
+        (0..num_items).for_each(|record| {
+            assert_eq!(btree.lookup(&record).unwrap(), Some(RecordRow(record)));
+        });
 
         // Drop it From Memory
         drop(btree);
 
-        // Load existing B-Tree and assert our previously inserted key is persisted.
-        let btree: BPlusTree<i32> = BPlusTree::load(String::from("test-data/test_database")).unwrap();
-        assert_eq!(btree.lookup(&10).unwrap(), Some(RecordRow(3)));
+        // Load existing B-Tree and assert our previously inserted keys are persisted.
+        let btree: BPlusTree<usize> = BPlusTree::load("test-data/insertion-split").unwrap();
+        (0..num_items).for_each(|record| {
+            assert_eq!(btree.lookup(&record).unwrap(), Some(RecordRow(record)));
+        });
+    }
+
+    /// Tests that the string key serialization and deserialization is working properly.
+    #[test]
+    fn test_string_key() {
+        let string = "abcd1234%^&*)\u{2122}";
+        let key = StringKey::<256>::try_from(string).unwrap();
+        let encoded = encode_to_vec(key.clone(), PageOffset::bincode_config()).unwrap();
+        let decoded: StringKey::<256> = decode_from_slice(encoded.as_slice(), PageOffset::bincode_config()).unwrap().0;
+        assert_eq!(key, decoded);
+    }
+
+    /// Tests that the B+ Tree string key works
+    #[test]
+    fn test_btree_string_key() {
+        reset_db_file("string-key").expect("Existing DB file must be cleared");
+
+        type EmailKey = StringKey::<256>; // Emails typically have a max length of 256.
+        let mut btree: BPlusTree<EmailKey> = BPlusTree::load("test-data/string-key").unwrap();
+        // Dummy emails from https://www.akto.io/tools/email-generator
+        let emails = [ // 20 emails guarantees at least 1 split, since at 4kb page sizes, each page can only have up to 15 keys.
+            "Austin59@gmail.com", "Orlo.Schulist73@gmail.com", "Leilani_Heller1@gmail.com",
+            "Ambrose_Hayes46@gmail.com", "Valentina67@gmail.com", "Lemuel19@gmail.com",
+            "Gerry_OConner12@gmail.com", "Hermina_Bogan@gmail.com", "Janessa58@gmail.com",
+            "Makenzie.McDermott@gmail.com", "Lane16@gmail.com", "Julie.Flatley@gmail.com",
+            "Deonte.Hermann61@gmail.com", "Archibald_Kutch@gmail.com", "Gonzalo_Rowe77@gmail.com",
+            "Filiberto79@gmail.com", "Melyssa_Windler@gmail.com", "Nakia.Satterfield@gmail.com",
+            "Buford.Bode68@gmail.com", "Marlen.Bruen@gmail.com",
+        ];
+        // Insert all the emails into the B+ Tree.
+        emails.iter().enumerate().try_for_each(|(record, &email)| {
+            btree.insert(&EmailKey::try_from(email).unwrap(), RecordRow(record))
+        }).expect("Should be able to insert all keys.");
+
+        // Assert that all emails were correctly stored, and can be looked up.
+        emails.iter().enumerate().for_each(|(record, &email)| {
+            assert_eq!(btree.lookup(&EmailKey::try_from(email).unwrap()).unwrap(), Some(RecordRow(record)));
+        });
+
+        // Drop it From Memory
+        drop(btree);
+
+        // Ensure that all insertions and the split were correctly persisted.
+        let btree: BPlusTree<EmailKey> = BPlusTree::load("test-data/string-key").unwrap();
+        emails.iter().enumerate().for_each(|(record, &email)| {
+            assert_eq!(btree.lookup(&EmailKey::try_from(email).unwrap()).unwrap(), Some(RecordRow(record)));
+        });
     }
 
 }

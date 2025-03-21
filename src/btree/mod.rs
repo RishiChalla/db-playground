@@ -84,31 +84,35 @@ impl<Key: Ord + Serialize + DeserializeOwned + Clone> TreeNode<Key> {
         self.splits.partition_point(|(split, _child)| *key >= *split)
     }
 
+    /// Inserts an item into this tree node, and recurses up if necessary.
+    /// All items are only modified in memory, and placed into the mutated_nodes vector. The disk is not written to at any point,
+    /// nor is the tree cache in RAM written to.
     fn insert_item(mut self, key: &Key, child: usize, tree: &BPlusTree<Key>, inner: &mut BPlusTreeInner, mutated_nodes: &mut Vec<Self>)
-        -> Result<(), DiskError> {
+        -> Result<(), IndexingError> {
         // Use binary search to find the partition point
         let partition = self.partition_point(key);
 
-        // The node has space to insert a new child.
-        if self.splits.len() < Self::max_splits() {
-            // Insert at the partition point to retain sorted order.
-            self.splits.insert(partition, (key.clone(), child));
+        // Check if the key already exists.
+        if self.splits[partition - 1].0 == *key {
+            return Err(IndexingError::InsertionAlreadyExists);
+        }
 
-            // The new key was smaller than everything in the node. This means we need to traverse upwards and update all parent pointers.
-            if partition == 0 {
-                let mut parent = self.parent;
-                while let Some(offset) = parent {
-                    let mut node = offset.load_node(tree)?;
-                    node.splits[0].0 = key.clone();
-                    parent = node.parent;
-                    mutated_nodes.push(node); // Mark the parent as mutated.
-                }
+        // Insert at the partition point to retain sorted order.
+        self.splits.insert(partition, (key.clone(), child));
+
+        // The new key was smaller than everything in the node. This means we need to traverse upwards and update all parent pointers.
+        if partition == 0 {
+            let mut parent = self.parent;
+            while let Some(offset) = parent {
+                let mut node = offset.load_node(tree)?;
+                node.splits[0].0 = key.clone();
+                parent = node.parent;
+                mutated_nodes.push(node); // Mark the parent as mutated.
             }
+        }
 
-            // Mark the node as mutated.
-            mutated_nodes.push(self);
-
-        } else { // The node has no space left, we need to split the node apart.
+        // The node has no space left, we need to split the node apart.
+        if self.splits.len() > Self::max_splits() {
             // Split the node, where the original node has the left-side. The right side is placed into a new node.
             let split_partition = self.splits.len() / 2;
             let right = self.splits.split_off(split_partition);
@@ -140,8 +144,11 @@ impl<Key: Ord + Serialize + DeserializeOwned + Clone> TreeNode<Key> {
                 mutated_nodes.push(root);
             }
 
-            mutated_nodes.extend_from_slice(&[self, right_node]);
+            mutated_nodes.push(right_node);
         }
+
+        // Mark the node as mutated.
+        mutated_nodes.push(self);
 
         Ok(())
     }
@@ -177,9 +184,9 @@ struct BPlusTreeInner {
     free_list: Vec<PageOffset>,
 }
 
-/// An error that may occur during Disk Operations with the B+ Tree.
+/// An error that may occur during Indexing Operations with the B+ Tree.
 #[derive(Debug)]
-pub enum DiskError {
+pub enum IndexingError {
     /// There was an IO Stream issue.
     /// > The Disk and RAM state is guaranteed to be stable, even if this error occurs.
     Io(io::Error),
@@ -195,11 +202,13 @@ pub enum DiskError {
     /// Occurs when a Tree node is attempted to be written into the dedicated inner metadata block.
     /// > The Disk and RAM state is guaranteed to be stable, even if this error occurs.
     MetadataOverwrite,
+    /// Occurs when attempting to insert onto a key that already exists.
+    InsertionAlreadyExists,
 }
 
 impl<Key: Ord + Serialize + DeserializeOwned + Clone> BPlusTree<Key> {
     /// Loads the B+ Tree from an index file path.
-    fn load(index_file_path: String) -> Result<Self, DiskError> {
+    fn load(index_file_path: String) -> Result<Self, IndexingError> {
         // Create a new LRU cache with the given cache size.
         let node_cache = RefCell::new(LruCache::new(NonZeroUsize::new(LRU_CACHE_SIZE).unwrap()));
         // If the file already exists, we're loading it, otherwise we're creating a new file.
@@ -207,7 +216,7 @@ impl<Key: Ord + Serialize + DeserializeOwned + Clone> BPlusTree<Key> {
         let index_file = OpenOptions::new()
             .read(true).write(true).create_new(!exists)
             .open(index_file_path)
-            .map_err(DiskError::Io)?;
+            .map_err(IndexingError::Io)?;
         let inner = BPlusTreeInner::default();
         // Create the tree and write / read the inner data.
         let mut tree = Self { node_cache, index_file, inner };
@@ -234,14 +243,14 @@ impl<Key: Ord + Serialize + DeserializeOwned + Clone> BPlusTree<Key> {
     /// Commits a series of transactions - that is updating both the inner and all provided nodes in an atomic operation.
     /// This commit either fully succeeds, or fully fails
     /// (in which case the state of the tree on Disk, and RAM is the same as prior to the transaction)
-    fn commit_transaction(&mut self, inner: BPlusTreeInner, nodes: Vec<TreeNode<Key>>) -> Result<(), DiskError> {
+    fn commit_transaction(&mut self, inner: BPlusTreeInner, nodes: Vec<TreeNode<Key>>) -> Result<(), IndexingError> {
         // First we take a backup of the inner metadata before doing any writes.
         let inner_checkpoint = self.inner.clone();
         // Attempt the write
         let inner_write = PageOffset::inner().write_page(&mut self.index_file, &inner);
         if let Err(error) = inner_write { // Something went wrong, attempt to revert it.
             PageOffset::inner().write_page(&mut self.index_file, &inner_checkpoint)
-                .map_err(|_| DiskError::Reversion { pages: vec![PageOffset::inner()] })?; // Reversion failed.
+                .map_err(|_| IndexingError::Reversion { pages: vec![PageOffset::inner()] })?; // Reversion failed.
             return Err(error);
         }
 
@@ -268,7 +277,7 @@ impl<Key: Ord + Serialize + DeserializeOwned + Clone> BPlusTree<Key> {
             }));
             // We found reversion errors
             if !reversion_errors.is_empty() {
-                Err(DiskError::Reversion { pages: reversion_errors })
+                Err(IndexingError::Reversion { pages: reversion_errors })
             } else { // Reversion was successful
                 Err(error)
             }
@@ -282,7 +291,7 @@ impl<Key: Ord + Serialize + DeserializeOwned + Clone> BPlusTree<Key> {
 
     /// Traverses the tree until it finds a leaf node where either the key resides as an exact match,
     /// or is matched by the leaf node's splitting criteria. Returns None if the tree is empty, and there is no root.
-    fn traverse_tree(&self, key: &Key) -> Result<Option<TreeNode<Key>>, DiskError> {
+    fn traverse_tree(&self, key: &Key) -> Result<Option<TreeNode<Key>>, IndexingError> {
         // Get the root node location
         let Some(node) = self.inner.root else { return Ok(None) };
         // Start with the root node, keep traversing until we encounter a leaf node.
@@ -301,7 +310,7 @@ impl<Key: Ord + Serialize + DeserializeOwned + Clone> BPlusTree<Key> {
     }
 
     /// Inserts a key and its associated record location into the index tree.
-    fn insert(&mut self, key: &Key, record: RecordRow) -> Result<(), DiskError> {
+    fn insert(&mut self, key: &Key, record: RecordRow) -> Result<(), IndexingError> {
         // We only modify a copy of the inner, to make operations atomic.
         let mut inner = self.inner.clone();
         let mut mutated_nodes = Vec::new();
@@ -335,13 +344,13 @@ impl<Key: Ord + Serialize + DeserializeOwned + Clone> BPlusTree<Key> {
     }
 
     /// Removes a key and its associated record from the index tree.
-    fn remove(&mut self, key: &Key) {
+    fn remove(&mut self, key: &Key) -> Result<(), IndexingError> {
         todo!()
     }
 
     /// Searches for the location of a record given its key. None is returned if there is no record found for
     /// the given key.
-    fn lookup(&self, key: &Key) -> Result<Option<RecordRow>, DiskError> {
+    fn lookup(&self, key: &Key) -> Result<Option<RecordRow>, IndexingError> {
         if let Some(leaf) = self.traverse_tree(key)? { // Traverse the tree to find a leaf
             // Binary search for the key within the leaf
             let record_idx = leaf.splits.binary_search_by_key(&key, |(split, _child)| split);
@@ -361,37 +370,39 @@ impl PageOffset {
     const fn inner() -> Self { Self(0) }
 
     /// Writes a single page of data into the B-Tree Index File.
-    fn write_page<Data: Serialize>(&self, index_file: &mut File, data: &Data) -> Result<(), DiskError> {
+    fn write_page<Data: Serialize>(&self, index_file: &mut File, data: &Data) -> Result<(), IndexingError> {
         // Create a writer and set its position to the page
-        let mut writer = BufWriter::new(index_file);
-        writer.seek(SeekFrom::Start((self.0 * PAGE_SIZE) as u64)).map_err(DiskError::Io)?;
+        let mut writer = BufWriter::new(&mut *index_file);
+        writer.seek(SeekFrom::Start((self.0 * PAGE_SIZE) as u64)).map_err(IndexingError::Io)?;
         // Create and populate a buffer with the serialized data, padded with 0s up to the page size.
         let mut buffer = Vec::with_capacity(PAGE_SIZE);
-        into_writer(&data, &mut buffer).map_err(DiskError::Serialization)?;
+        into_writer(&data, &mut buffer).map_err(IndexingError::Serialization)?;
         buffer.resize(PAGE_SIZE, 0);
         // Write the buffer to the writer, and flush it.
-        writer.write_all(&buffer).map_err(DiskError::Io)?;
-        writer.flush().map_err(DiskError::Io)?;
+        writer.write_all(&buffer).map_err(IndexingError::Io)?;
+        writer.flush().map_err(IndexingError::Io)?;
+        drop(writer);
+        index_file.sync_data().map_err(IndexingError::Io)?;
         Ok(())
     }
     
     /// Reads a single page of Data from the B-Tree index file and returns it.
-    fn read_page<Data: DeserializeOwned>(&self, index_file: &File) -> Result<Data, DiskError> {
+    fn read_page<Data: DeserializeOwned>(&self, index_file: &File) -> Result<Data, IndexingError> {
         // Create a reader and set its position to the page
         let mut reader = BufReader::new(index_file);
-        reader.seek(SeekFrom::Start((self.0 * PAGE_SIZE) as u64)).map_err(DiskError::Io)?;
+        reader.seek(SeekFrom::Start((self.0 * PAGE_SIZE) as u64)).map_err(IndexingError::Io)?;
         // Read a page into the memory.
         let mut buffer = vec![0; PAGE_SIZE];
-        reader.read_exact(&mut buffer).map_err(DiskError::Io)?;
+        reader.read_exact(&mut buffer).map_err(IndexingError::Io)?;
         // Deserialize the page and save it.
-        let data = from_reader(buffer.as_slice()).map_err(DiskError::Deserialization)?;
+        let data = from_reader(buffer.as_slice()).map_err(IndexingError::Deserialization)?;
         Ok(data)
     }
 
     /// Attempts to load a node, using the LRU Caching strategy. If the node is not present in cache, it is retrieved from disk, and cached for future use.
-    fn load_node<Key>(&self, tree: &BPlusTree<Key>) -> Result<TreeNode<Key>, DiskError>
+    fn load_node<Key>(&self, tree: &BPlusTree<Key>) -> Result<TreeNode<Key>, IndexingError>
     where Key: Ord + Serialize + DeserializeOwned + Clone {
-        if *self == Self::inner() { return Err(DiskError::MetadataOverwrite); }
+        if *self == Self::inner() { return Err(IndexingError::MetadataOverwrite); }
         let mut node_cache = tree.node_cache.borrow_mut();
         if let Some(node) = node_cache.get(self) {
             Ok(node.clone())
@@ -405,23 +416,40 @@ impl PageOffset {
 
 #[cfg(test)]
 mod test {
-    use std::{fs::remove_file, path::Path};
+    use std::{fs::{create_dir, remove_file}, io::{self, ErrorKind}, path::Path};
+    use super::{BPlusTree, RecordRow};
 
-    use crate::btree::RecordRow;
+    /// Resets the DB file, and creates a folder if necessary.
+    fn reset_db_file(path: &'static str) -> Result<(), io::Error> {
+        // Create the test data folder, ignore already existing error.
+        if let Err(error) = create_dir("test-data/") {
+            if error.kind() != ErrorKind::AlreadyExists { return Err(error); }
+        }
 
-    use super::BPlusTree;
-    
+        // Remove the DB file, ignore if the DB file doesn't already exist
+        if let Err(error) = remove_file(Path::new(&(String::from("test-data/") + path))) {
+            if error.kind() != ErrorKind::NotFound { return Err(error); }
+        }
+
+        Ok(())
+    }
+
+    /// Tests that the B+ Tree data is persisted in the DB file.
     #[test]
-    fn test_btree() {
-        let _ = remove_file(Path::new("test_database"));
-        let mut btree: BPlusTree<i32> = BPlusTree::load(String::from("test_database")).unwrap();
+    fn test_btree_persistence() {
+        reset_db_file("test_database").expect("Existing DB file must be cleared");
+
+        // Create empty B-Tree (ensure it is empty)
+        let mut btree: BPlusTree<i32> = BPlusTree::load(String::from("test-data/test_database")).unwrap();
         assert_eq!(btree.lookup(&10).unwrap(), None);
         btree.insert(&10, RecordRow(3)).unwrap();
         assert_eq!(btree.lookup(&10).unwrap(), Some(RecordRow(3)));
 
+        // Drop it From Memory
         drop(btree);
 
-        let btree: BPlusTree<i32> = BPlusTree::load(String::from("test_database")).unwrap();
+        // Load existing B-Tree and assert our previously inserted key is persisted.
+        let btree: BPlusTree<i32> = BPlusTree::load(String::from("test-data/test_database")).unwrap();
         assert_eq!(btree.lookup(&10).unwrap(), Some(RecordRow(3)));
     }
 

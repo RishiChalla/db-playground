@@ -1,2 +1,11 @@
+# Rust Target Binaries
 /target
+
+# VSCode Settings
 .vscode/
+
+# Unit Testing Generated Test Data.
+test-data/
+
+# Code Coverage reports
+lcov.info

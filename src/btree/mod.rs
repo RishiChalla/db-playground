@@ -1,8 +1,7 @@
-use std::{cell::RefCell, fs::{File, OpenOptions}, io::{self, BufReader, BufWriter, Read, Seek, SeekFrom, Write}, num::NonZeroUsize, path::Path};
+use std::{cell::RefCell, fs::{File, OpenOptions}, io::{self, BufReader, BufWriter, Seek, SeekFrom, Write}, num::NonZeroUsize, path::Path};
 
+use bincode::{config, decode_from_reader, encode_to_vec, error::{DecodeError, EncodeError}, Decode, Encode};
 use lru::LruCache;
-use serde::{de::DeserializeOwned, Deserialize, Serialize};
-use ciborium::{ser, de, from_reader, into_writer};
 
 /// The size of a single page (data blob section in the B-Tree Index file)
 const PAGE_SIZE: usize = 4000;
@@ -11,7 +10,7 @@ const PAGE_SIZE: usize = 4000;
 const LRU_CACHE_SIZE: usize = 4_000_000_000 / PAGE_SIZE;
 
 /// The offset number of pages, to reach a given page, this uniquely identified every tree node.
-#[derive(Debug, Hash, PartialEq, Eq, PartialOrd, Ord, Serialize, Deserialize, Clone, Copy)]
+#[derive(Debug, Hash, PartialEq, Eq, PartialOrd, Ord, Encode, Decode, Clone, Copy)]
 pub struct PageOffset(usize);
 
 impl Default for PageOffset {
@@ -20,13 +19,13 @@ impl Default for PageOffset {
 }
 
 /// Uniquely identifies a record in the records database.
-#[derive(Debug, Hash, PartialEq, Eq, PartialOrd, Ord, Serialize, Deserialize, Default, Clone, Copy)]
+#[derive(Debug, Hash, PartialEq, Eq, PartialOrd, Ord, Encode, Decode, Default, Clone, Copy)]
 struct RecordRow(usize);
 
 /// The variant of a tree node, a tree node can either be a branch or a leaf.
 /// This changes the interpretation of the usize in `TreeNode::splits` and `TreeNode::first` to a RecordRow for leaves,
 /// and a PageOffset for branches.
-#[derive(Debug, Serialize, Deserialize, Clone, Copy, PartialEq, Eq)]
+#[derive(Debug, Encode, Decode, Clone, Copy, PartialEq, Eq)]
 enum TreeNodeVariant {
     /// The child is a leaf node, with actual data.
     Leaf,
@@ -36,8 +35,8 @@ enum TreeNodeVariant {
 
 /// Contains a node of the B+ Tree. This contains actual data, including splitting factors and/or leaves and record locations.
 /// This is a dense data format, and is cached by LRU, and indexed by PageOffset.
-#[derive(Debug, Serialize, Deserialize, Clone)]
-struct TreeNode<Key: Ord + Serialize + Clone> {
+#[derive(Debug, Encode, Decode, Clone)]
+struct TreeNode<Key: Ord + Encode + Decode<()> + Clone> {
     /// The offset of the page, in the index file containing the B+ Tree
     offset: PageOffset,
     /// A pointer to the left node, useful for traversing the B+ Tree sequentially.
@@ -59,7 +58,7 @@ struct TreeNode<Key: Ord + Serialize + Clone> {
     variant: TreeNodeVariant,
 }
 
-impl<Key: Ord + Serialize + DeserializeOwned + Clone> Default for TreeNode<Key> {
+impl<Key: Ord + Encode + Decode<()> + Clone> Default for TreeNode<Key> {
     fn default() -> Self {
         Self {
             offset: PageOffset(0),
@@ -72,7 +71,7 @@ impl<Key: Ord + Serialize + DeserializeOwned + Clone> Default for TreeNode<Key> 
     }
 }
 
-impl<Key: Ord + Serialize + DeserializeOwned + Clone> TreeNode<Key> {
+impl<Key: Ord + Encode + Decode<()> + Clone> TreeNode<Key> {
     /// Retrieves the maximum number of splits in a single tree node.
     /// This is determined by the size of the Keys, relative to the size of a page.
     const fn max_splits() -> usize {
@@ -158,7 +157,7 @@ impl<Key: Ord + Serialize + DeserializeOwned + Clone> TreeNode<Key> {
 /// The Tree is held on disk, in an indexing file, and pages of it is read to RAM when needed on lookups. Lookups or insertions yield a relevant
 /// Record Row, which both uniquely identifies database records, and provides random access.
 #[derive(Debug)]
-struct BPlusTree<Key: Ord + Serialize + DeserializeOwned + Clone> {
+struct BPlusTree<Key: Ord + Encode + Decode<()> + Clone> {
     /// The cache containing node pages in memory. If a tree node is not present in this cache, it must be loaded from disk, and will replace
     /// the most unused node from this cache.
     node_cache: RefCell<LruCache<PageOffset, TreeNode<Key>>>,
@@ -169,7 +168,7 @@ struct BPlusTree<Key: Ord + Serialize + DeserializeOwned + Clone> {
 }
 
 /// Contains the interior data of the B+ Tree. All interior data must be loaded and synchronized with the disk-saved B+ Tree.
-#[derive(Debug, Default, Serialize, Deserialize, Clone)]
+#[derive(Debug, Default, Encode, Decode, Clone)]
 struct BPlusTreeInner {
     /// The root node of the B+ Tree
     root: Option<PageOffset>,
@@ -195,10 +194,10 @@ pub enum IndexingError {
     Reversion { pages: Vec<PageOffset> },
     /// There was a serialization issue.
     /// > The Disk and RAM state is guaranteed to be stable, even if this error occurs.
-    Serialization(ser::Error<io::Error>),
+    Serialization(EncodeError),
     /// There was a deserialization issue.
     /// > The Disk and RAM state is guaranteed to be stable, even if this error occurs.
-    Deserialization(de::Error<io::Error>),
+    Deserialization(DecodeError),
     /// Occurs when a Tree node is attempted to be written into the dedicated inner metadata block.
     /// > The Disk and RAM state is guaranteed to be stable, even if this error occurs.
     MetadataOverwrite,
@@ -206,7 +205,7 @@ pub enum IndexingError {
     InsertionAlreadyExists,
 }
 
-impl<Key: Ord + Serialize + DeserializeOwned + Clone> BPlusTree<Key> {
+impl<Key: Ord + Encode + Decode<()> + Clone> BPlusTree<Key> {
     /// Loads the B+ Tree from an index file path.
     fn load(index_file_path: String) -> Result<Self, IndexingError> {
         // Create a new LRU cache with the given cache size.
@@ -370,13 +369,12 @@ impl PageOffset {
     const fn inner() -> Self { Self(0) }
 
     /// Writes a single page of data into the B-Tree Index File.
-    fn write_page<Data: Serialize>(&self, index_file: &mut File, data: &Data) -> Result<(), IndexingError> {
+    fn write_page<Data: Encode>(&self, index_file: &mut File, data: &Data) -> Result<(), IndexingError> {
         // Create a writer and set its position to the page
         let mut writer = BufWriter::new(&mut *index_file);
         writer.seek(SeekFrom::Start((self.0 * PAGE_SIZE) as u64)).map_err(IndexingError::Io)?;
         // Create and populate a buffer with the serialized data, padded with 0s up to the page size.
-        let mut buffer = Vec::with_capacity(PAGE_SIZE);
-        into_writer(&data, &mut buffer).map_err(IndexingError::Serialization)?;
+        let mut buffer = encode_to_vec(data, config::standard()).map_err(IndexingError::Serialization)?;
         buffer.resize(PAGE_SIZE, 0);
         // Write the buffer to the writer, and flush it.
         writer.write_all(&buffer).map_err(IndexingError::Io)?;
@@ -387,21 +385,18 @@ impl PageOffset {
     }
     
     /// Reads a single page of Data from the B-Tree index file and returns it.
-    fn read_page<Data: DeserializeOwned>(&self, index_file: &File) -> Result<Data, IndexingError> {
+    fn read_page<Data: Decode<()>>(&self, index_file: &File) -> Result<Data, IndexingError> {
         // Create a reader and set its position to the page
         let mut reader = BufReader::new(index_file);
         reader.seek(SeekFrom::Start((self.0 * PAGE_SIZE) as u64)).map_err(IndexingError::Io)?;
-        // Read a page into the memory.
-        let mut buffer = vec![0; PAGE_SIZE];
-        reader.read_exact(&mut buffer).map_err(IndexingError::Io)?;
         // Deserialize the page and save it.
-        let data = from_reader(buffer.as_slice()).map_err(IndexingError::Deserialization)?;
+        let data = decode_from_reader(reader, config::standard()).map_err(IndexingError::Deserialization)?;
         Ok(data)
     }
 
     /// Attempts to load a node, using the LRU Caching strategy. If the node is not present in cache, it is retrieved from disk, and cached for future use.
     fn load_node<Key>(&self, tree: &BPlusTree<Key>) -> Result<TreeNode<Key>, IndexingError>
-    where Key: Ord + Serialize + DeserializeOwned + Clone {
+    where Key: Ord + Encode + Decode<()> + Clone {
         if *self == Self::inner() { return Err(IndexingError::MetadataOverwrite); }
         let mut node_cache = tree.node_cache.borrow_mut();
         if let Some(node) = node_cache.get(self) {

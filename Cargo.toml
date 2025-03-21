@@ -4,6 +4,5 @@ version = "0.1.0"
 edition = "2021"
 
 [dependencies]
-ciborium = "0.2.2"
+bincode = "2.0.1"
 lru = "0.13.0"
-serde = "1.0.219"

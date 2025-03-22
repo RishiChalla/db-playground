@@ -1,5 +1,5 @@
 use std::{
-    cell::RefCell, fmt::Debug, fs::{File, OpenOptions}, io::{self, BufReader, BufWriter, Seek, SeekFrom, Write}, num::NonZeroUsize, ops::Deref, path::Path
+    cell::RefCell, collections::HashMap, fmt::Debug, fs::{File, OpenOptions}, io::{self, BufReader, BufWriter, Seek, SeekFrom, Write}, num::NonZeroUsize, ops::Deref, path::Path
 };
 
 use bincode::{
@@ -150,10 +150,16 @@ impl<Key: IndexKey> TreeNode<Key> {
     }
 
     /// Inserts an item into this tree node, and recurses up if necessary.
-    /// All items are only modified in memory, and placed into the mutated_nodes vector. The disk is not written to at any point,
+    /// All items are only modified in memory, and placed into the mutated_nodes map. The disk is not written to at any point,
     /// nor is the tree cache in RAM written to.
-    fn insert_item(mut self, key: &Key, child: usize, tree: &BPlusTree<Key>, inner: &mut BPlusTreeInner, mutated_nodes: &mut Vec<Self>)
-        -> Result<(), IndexingError> {
+    fn insert_item(
+        mut self,
+        key: &Key,
+        child: usize,
+        tree: &BPlusTree<Key>,
+        inner: &mut BPlusTreeInner,
+        mutated_nodes: &mut HashMap<PageOffset, Self>,
+    ) -> Result<(), IndexingError> {
         // Use binary search to find the partition point
         let partition = self.partition_point(key);
 
@@ -162,10 +168,13 @@ impl<Key: IndexKey> TreeNode<Key> {
         if partition == 0 {
             let mut parent = self.parent;
             while let Some(offset) = parent {
-                let mut node = offset.load_node(tree)?;
+                let mut node = {
+                    if let Some(node) = mutated_nodes.get(&offset) { node.clone() }
+                    else { offset.load_node(tree)? }
+                };
                 node.splits[0].key = key.clone();
                 parent = node.parent;
-                mutated_nodes.push(node); // Mark the parent as mutated.
+                mutated_nodes.insert(node.offset, node); // Mark the parent as mutated.
             }
         } else if self.splits[partition - 1].key == *key { // Check if the key already exists.
             return Err(IndexingError::InsertionAlreadyExists);
@@ -189,9 +198,25 @@ impl<Key: IndexKey> TreeNode<Key> {
             };
             self.right = Some(right_node.offset);
 
+            // If this node / the new node are branches, then all children need to have their parent pointer updated.
+            if self.variant == TreeNodeVariant::Branch {
+                let children = right_node.splits.iter().map(|TreeNodeChild { key: _, child }| -> Result<_, _> {
+                    let offset = PageOffset(*child);
+                    let mut child_node = {
+                        if let Some(node) = mutated_nodes.get(&offset) { node.clone() }
+                        else { offset.load_node(tree)? }
+                    };
+                    child_node.parent = Some(right_node.offset);
+                    Ok((child_node.offset, child_node))
+                }).collect::<Result<Vec<(PageOffset, TreeNode<Key>)>, IndexingError>>()?;
+                mutated_nodes.extend(children.into_iter());
+            }
+
             // We need to add the right side to the parent.
             if let Some(parent) = self.parent {
                 let parent = parent.load_node(tree)?;
+                mutated_nodes.insert(self.offset, self.clone());
+                mutated_nodes.insert(right_node.offset, right_node.clone());
                 parent.insert_item(&right_node.splits[0].key, right_node.offset.0, tree, inner, mutated_nodes)?;
             } else { // We have no parent, we need to make a new root and increase the depth of the tree.
                 inner.depth += 1;
@@ -207,14 +232,15 @@ impl<Key: IndexKey> TreeNode<Key> {
                 inner.root = Some(root.offset);
                 self.parent = Some(root.offset);
                 right_node.parent = Some(root.offset);
-                mutated_nodes.push(root);
+                mutated_nodes.insert(root.offset, root);
+                mutated_nodes.insert(right_node.offset, right_node);
+                mutated_nodes.insert(self.offset, self);
             }
-
-            mutated_nodes.push(right_node);
+        } else {
+            // Mark the node as mutated.
+            mutated_nodes.insert(self.offset, self);
         }
 
-        // Mark the node as mutated.
-        mutated_nodes.push(self);
 
         Ok(())
     }
@@ -312,7 +338,10 @@ impl<Key: IndexKey> BPlusTree<Key> {
     /// Commits a series of transactions - that is updating both the inner and all provided nodes in an atomic operation.
     /// This commit either fully succeeds, or fully fails
     /// (in which case the state of the tree on Disk, and RAM is the same as prior to the transaction)
-    fn commit_transaction(&mut self, inner: BPlusTreeInner, nodes: Vec<TreeNode<Key>>) -> Result<(), IndexingError> {
+    fn commit_transaction(
+        &mut self, inner: BPlusTreeInner,
+        nodes: HashMap<PageOffset, TreeNode<Key>>,
+    ) -> Result<(), IndexingError> {
         // First we take a backup of the inner metadata before doing any writes.
         let inner_checkpoint = self.inner.clone();
         // Attempt the write
@@ -325,7 +354,7 @@ impl<Key: IndexKey> BPlusTree<Key> {
 
         // We save each node prior to the mutation, to revert to in the case of a failure.
         let mut node_checkpoints = Vec::with_capacity(nodes.len());
-        let node_write = nodes.iter().try_for_each(|node| {
+        let node_write = nodes.iter().try_for_each(|(_offset, node)| {
             // We only make checkpoints of overwrites. New insertions do not have data they are overwriting.
             if node.offset < inner_checkpoint.next_page {
                 node_checkpoints.push(node.offset.load_node(self)?);
@@ -353,7 +382,7 @@ impl<Key: IndexKey> BPlusTree<Key> {
         } else { // All writes were successful - we need to update the nodes and inner in RAM
             self.inner = inner;
             let mut node_cache = self.node_cache.borrow_mut();
-            for node in nodes { node_cache.put(node.offset, node); }
+            for (_offset, node) in nodes { node_cache.put(node.offset, node); }
             Ok(())
         }
     }
@@ -382,7 +411,10 @@ impl<Key: IndexKey> BPlusTree<Key> {
     fn insert(&mut self, key: &Key, record: RecordRow) -> Result<(), IndexingError> {
         // We only modify a copy of the inner, to make operations atomic.
         let mut inner = self.inner.clone();
-        let mut mutated_nodes = Vec::new();
+        // Mutated nodes is a map, since each PageOffset uniquely identifies one page / node.
+        // By using a map, we force our code / the Rust compiler to enforce at most a single mutation per node
+        // in a transaction.
+        let mut mutated_nodes = HashMap::new();
 
         inner.size += 1;
 
@@ -391,11 +423,6 @@ impl<Key: IndexKey> BPlusTree<Key> {
         if let Some(leaf) = self.traverse_tree(key)? {
             // Insert the item into the leaf (which recursively inserts up if/when necessary)
             leaf.insert_item(key, record.0, self, &mut inner, &mut mutated_nodes)?;
-            // Insert item internally uses recursion, which means new pages are actually in an inverse order
-            // (ie new insertion at page 5 is before page 4). However attempting to write to page 5 before page 4 exists will cause
-            // a write error, thus we reverse the mutations to ensure they're done in insertion order.
-            // (We could also do a sort for more safety, but a reverse is faster and fine in this case)
-            mutated_nodes.reverse();
         } else { // Create a new root at the insertion point.
             let root = TreeNode {
                 offset: Self::get_insertion_point(&mut inner),
@@ -405,7 +432,7 @@ impl<Key: IndexKey> BPlusTree<Key> {
             };
             inner.depth += 1;
             inner.root = Some(root.offset);
-            mutated_nodes.push(root);
+            mutated_nodes.insert(root.offset, root);
         }
 
         // No mutations are done up to this point, all mutations are done at once with this operation.

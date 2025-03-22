@@ -43,7 +43,9 @@ impl<'a, const MAX_SIZE: usize> TryFrom<&'a str> for StringKey<MAX_SIZE> {
 impl<const MAX_SIZE: usize> Encode for StringKey<MAX_SIZE> {
     fn encode<E: Encoder>(&self, encoder: &mut E) -> Result<(), EncodeError> {
         (self.0.len() as u32).encode(encoder)?;
-        encoder.writer().write(self.0.as_bytes())
+        let mut bytes = Vec::from(self.0.as_bytes());
+        bytes.resize(MAX_SIZE, 0);
+        encoder.writer().write(bytes.as_slice())
     }
 }
 
@@ -88,6 +90,15 @@ enum TreeNodeVariant {
     Branch,
 }
 
+/// A single child pointer under a tree-node.
+/// All items in a child of a split, will always be greater than or equal to its associated key.
+/// The child is a RecordRow when this is a leaf node, or a PageOffset when this is a branch node.
+#[derive(Debug, Encode, Decode, Clone, PartialEq, Eq)]
+struct TreeNodeChild<Key: IndexKey> {
+    key: Key,
+    child: usize,
+}
+
 /// Contains a node of the B+ Tree. This contains actual data, including splitting factors and/or leaves and record locations.
 /// This is a dense data format, and is cached by LRU, and indexed by PageOffset.
 #[derive(Debug, Encode, Decode, Clone, PartialEq, Eq)]
@@ -108,7 +119,7 @@ struct TreeNode<Key: IndexKey> {
     /// All items in a child of a split, will always be greater than or equal to its associated key.
     /// We opt to use a vector instead of fixed-arrays since Serde does not support const generics.
     /// The child is a RecordRow when this is a leaf node, or a PageOffset when this is a branch node.
-    splits: Vec<(Key, usize)>,
+    splits: Vec<TreeNodeChild<Key>>,
     /// Whether this is a leaf or branch node, this determines the interpretation of `splits` and `first`.
     variant: TreeNodeVariant,
 }
@@ -130,12 +141,12 @@ impl<Key: IndexKey> TreeNode<Key> {
     /// Retrieves the maximum number of splits in a single tree node.
     /// This is determined by the size of the Keys, relative to the size of a page.
     const fn max_splits() -> usize {
-        (PAGE_SIZE - std::mem::size_of::<Self>()) / std::mem::size_of::<(Key, usize)>()
+        (PAGE_SIZE - std::mem::size_of::<Self>()) / (std::mem::size_of::<Key>() + std::mem::size_of::<usize>())
     }
 
     /// Uses binary search to find the first item after 
     fn partition_point(&self, key: &Key) -> usize {
-        self.splits.partition_point(|(split, _child)| *key >= *split)
+        self.splits.partition_point(|TreeNodeChild { key: split, child: _ }| *key >= *split)
     }
 
     /// Inserts an item into this tree node, and recurses up if necessary.
@@ -152,16 +163,16 @@ impl<Key: IndexKey> TreeNode<Key> {
             let mut parent = self.parent;
             while let Some(offset) = parent {
                 let mut node = offset.load_node(tree)?;
-                node.splits[0].0 = key.clone();
+                node.splits[0].key = key.clone();
                 parent = node.parent;
                 mutated_nodes.push(node); // Mark the parent as mutated.
             }
-        } else if self.splits[partition - 1].0 == *key { // Check if the key already exists.
+        } else if self.splits[partition - 1].key == *key { // Check if the key already exists.
             return Err(IndexingError::InsertionAlreadyExists);
         }
 
         // Insert at the partition point to retain sorted order.
-        self.splits.insert(partition, (key.clone(), child));
+        self.splits.insert(partition, TreeNodeChild { key: key.clone(), child });
 
         // The node has no space left, we need to split the node apart.
         if self.splits.len() > Self::max_splits() {
@@ -181,12 +192,15 @@ impl<Key: IndexKey> TreeNode<Key> {
             // We need to add the right side to the parent.
             if let Some(parent) = self.parent {
                 let parent = parent.load_node(tree)?;
-                parent.insert_item(&right_node.splits[0].0, right_node.offset.0, tree, inner, mutated_nodes)?;
+                parent.insert_item(&right_node.splits[0].key, right_node.offset.0, tree, inner, mutated_nodes)?;
             } else { // We have no parent, we need to make a new root and increase the depth of the tree.
                 inner.depth += 1;
                 let root = TreeNode {
                     offset: BPlusTree::<Key>::get_insertion_point(inner),
-                    splits: vec![(self.splits[0].0.clone(), self.offset.0), (right_node.splits[0].0.clone(), right_node.offset.0)],
+                    splits: vec![
+                        TreeNodeChild { key: self.splits[0].key.clone(), child: self.offset.0},
+                        TreeNodeChild { key: right_node.splits[0].key.clone(), child: right_node.offset.0}
+                    ],
                     variant: TreeNodeVariant::Branch,
                     ..Default::default()
                 };
@@ -354,11 +368,11 @@ impl<Key: IndexKey> BPlusTree<Key> {
         while node.variant == TreeNodeVariant::Branch {
             // Use a binary search to find the partition point, the number of splitters in a single node
             // will likely be very large on average for most key sizes.
-            let partition = node.splits.partition_point(|(split, _child)| *key >= *split);
+            let partition = node.partition_point(key);
             // Fetch the next page offset based on the partition point.
             let split_idx = if partition == 0 { 0 } else { partition - 1 };
             // Traverse to the next node.
-            node = PageOffset(node.splits[split_idx].1).load_node(self)?;
+            node = PageOffset(node.splits[split_idx].child).load_node(self)?;
         }
         
         Ok(Some(node))
@@ -385,7 +399,7 @@ impl<Key: IndexKey> BPlusTree<Key> {
         } else { // Create a new root at the insertion point.
             let root = TreeNode {
                 offset: Self::get_insertion_point(&mut inner),
-                splits: vec![(key.clone(), record.0)],
+                splits: vec![TreeNodeChild { key: key.clone(), child: record.0 }],
                 variant: TreeNodeVariant::Leaf,
                 ..Default::default()
             };
@@ -408,9 +422,9 @@ impl<Key: IndexKey> BPlusTree<Key> {
     fn lookup(&self, key: &Key) -> Result<Option<RecordRow>, IndexingError> {
         if let Some(leaf) = self.traverse_tree(key)? { // Traverse the tree to find a leaf
             // Binary search for the key within the leaf
-            let record_idx = leaf.splits.binary_search_by_key(&key, |(split, _child)| split);
+            let record_idx = leaf.splits.binary_search_by_key(&key, |TreeNodeChild { key, child: _child }| key);
             if let Ok(record_idx) = record_idx { // Record found - return it
-                Ok(Some(RecordRow(leaf.splits[record_idx].1)))
+                Ok(Some(RecordRow(leaf.splits[record_idx].child)))
             } else { // No record found in the leaf.
                 Ok(None)
             }
@@ -433,7 +447,7 @@ impl PageOffset {
     }
 
     /// Writes a single page of data into the B-Tree Index File.
-    fn write_page<Data: Encode + Decode<()> + Eq + Debug>(&self, index_file: &mut File, data: &Data) -> Result<(), IndexingError> {
+    fn write_page<Data: Encode>(&self, index_file: &mut File, data: &Data) -> Result<(), IndexingError> {
         // Create a writer and set its position to the page
         let mut writer = BufWriter::new(&mut *index_file);
         writer.seek(SeekFrom::Start((self.0 * PAGE_SIZE) as u64)).map_err(IndexingError::Io)?;
@@ -446,10 +460,6 @@ impl PageOffset {
         writer.flush().map_err(IndexingError::Io)?;
         drop(writer);
         index_file.sync_data().map_err(IndexingError::Io)?;
-
-        // Debug Only - Assert the page we just wrote to is actually equal to the data we wrote, when read.
-        // TODO - Get rid of this (this is just for testing string keys.)
-        // debug_assert_eq!(*data, self.read_page(index_file).unwrap());
 
         Ok(())
     }
@@ -482,7 +492,8 @@ impl PageOffset {
 mod test {
     use std::{fs::{create_dir, remove_file}, io::{self, ErrorKind}, path::Path};
     use bincode::{decode_from_slice, encode_to_vec};
-    use super::{BPlusTree, PageOffset, RecordRow, StringKey, TreeNode, IndexingError};
+    use rand::{rng, seq::SliceRandom};
+    use super::{BPlusTree, IndexKey, IndexingError, PageOffset, RecordRow, StringKey, TreeNode};
 
     /// Resets the DB file, and creates a folder if necessary.
     fn reset_db_file(path: &'static str) -> Result<(), io::Error> {
@@ -497,6 +508,41 @@ mod test {
         }
 
         Ok(())
+    }
+
+    /// Tests a set of records against the database, first by inserting them while looking up each insertion.
+    /// Then by looking up all records, after all insertions are complete.
+    /// And finally by dropping the database, and reading it from Disk again and ensuring all lookups are available.
+    fn test_records<Key: IndexKey, It: Iterator<Item = (Key, RecordRow)> + Clone>(file: &'static str, records: It, randomize: bool) {
+        // Create an empty B+ Tree after resetting any existing DB
+        reset_db_file(file).expect("Existing DB file must be cleared");
+        let mut btree: BPlusTree<Key> = BPlusTree::load(String::from("test-data/") + file).unwrap();
+
+        // Collect and shuffle the records
+        let mut records: Vec<_> = records.collect();
+        if randomize { records.shuffle(&mut rng()); }
+
+        // Insert all items into the B+ Tree.
+        for (key, record) in records.iter() {
+            btree.insert(key, *record).unwrap();
+            assert_eq!(btree.lookup(key).unwrap(), Some(*record));
+        }
+
+        // Assert that all added items are present, after all insertions.
+        if randomize { records.shuffle(&mut rng()); }
+        for (key, record) in records.iter() {
+            assert_eq!(btree.lookup(key).unwrap(), Some(*record));
+        }
+
+        // Drop it From Memory
+        drop(btree);
+
+        // Load existing B-Tree and assert our previously inserted keys are persisted.
+        let btree: BPlusTree<Key> = BPlusTree::load(String::from("test-data/") + file).unwrap();
+        if randomize { records.shuffle(&mut rng()); }
+        for (key, record) in records.iter() {
+            assert_eq!(btree.lookup(key).unwrap(), Some(*record));
+        }
     }
 
     /// Tests that the B+ Tree correctly handles overwriting attempts.
@@ -516,33 +562,8 @@ mod test {
     /// Tests that the B+ Tree data splits correctly when inserting.
     #[test]
     fn test_btree_insertion_split() {
-        reset_db_file("insertion-split").expect("Existing DB file must be cleared");
-
-        // Create an empty B+ Tree and query its max splits per node.
-        // max_splits ^ 2 will be guaranteed to have at least 2 levels, and will most likely have 3.
-        let mut btree: BPlusTree<usize> = BPlusTree::load("test-data/insertion-split").unwrap();
-        let num_items = TreeNode::<usize>::max_splits() * TreeNode::<usize>::max_splits();
-
-        println!("Testing {} insertions.", num_items);
-
-        // Insert all items into the B+ Tree.
-        (0..num_items).try_for_each(|record| {
-            btree.insert(&record, RecordRow(record))
-        }).expect("Should be able to insert all keys.");
-
-        // Assert that all added items are present
-        (0..num_items).for_each(|record| {
-            assert_eq!(btree.lookup(&record).unwrap(), Some(RecordRow(record)));
-        });
-
-        // Drop it From Memory
-        drop(btree);
-
-        // Load existing B-Tree and assert our previously inserted keys are persisted.
-        let btree: BPlusTree<usize> = BPlusTree::load("test-data/insertion-split").unwrap();
-        (0..num_items).for_each(|record| {
-            assert_eq!(btree.lookup(&record).unwrap(), Some(RecordRow(record)));
-        });
+        let num_items = TreeNode::<usize>::max_splits(); // This will always have 2 levels.
+        test_records("insertion-split", (0..num_items).map(|i| (i, RecordRow(i))), true);
     }
 
     /// Tests that the string key serialization and deserialization is working properly.
@@ -558,10 +579,7 @@ mod test {
     /// Tests that the B+ Tree string key works
     #[test]
     fn test_btree_string_key() {
-        reset_db_file("string-key").expect("Existing DB file must be cleared");
-
         type EmailKey = StringKey::<256>; // Emails typically have a max length of 256.
-        let mut btree: BPlusTree<EmailKey> = BPlusTree::load("test-data/string-key").unwrap();
         // Dummy emails from https://www.akto.io/tools/email-generator
         let emails = [ // 20 emails guarantees at least 1 split, since at 4kb page sizes, each page can only have up to 15 keys.
             "Austin59@gmail.com", "Orlo.Schulist73@gmail.com", "Leilani_Heller1@gmail.com",
@@ -572,24 +590,31 @@ mod test {
             "Filiberto79@gmail.com", "Melyssa_Windler@gmail.com", "Nakia.Satterfield@gmail.com",
             "Buford.Bode68@gmail.com", "Marlen.Bruen@gmail.com",
         ];
-        // Insert all the emails into the B+ Tree.
-        emails.iter().enumerate().try_for_each(|(record, &email)| {
-            btree.insert(&EmailKey::try_from(email).unwrap(), RecordRow(record))
-        }).expect("Should be able to insert all keys.");
+        test_records("string-key", emails.into_iter().enumerate().map(|(record, email)| {
+            (EmailKey::try_from(email).unwrap(), RecordRow(record))
+        }), true);
+    }
 
-        // Assert that all emails were correctly stored, and can be looked up.
-        emails.iter().enumerate().for_each(|(record, &email)| {
-            assert_eq!(btree.lookup(&EmailKey::try_from(email).unwrap()).unwrap(), Some(RecordRow(record)));
-        });
+    /// Tests that the B+ Tree correctly handles 3+ layers, particularly the third layer
+    /// is the first time a new branch root is created from a split
+    #[test]
+    fn test_deep_tree() { // This test is currently failing, and I'm not sure how/why.
+        type LargeKey = StringKey::<512>; // 512 characters in a key is extremely large. Very few splits are supported per page.
+        let num_items = TreeNode::<LargeKey>::max_splits() * TreeNode::<LargeKey>::max_splits(); // Should be less than 64
 
-        // Drop it From Memory
-        drop(btree);
+        test_records("deep-tree", (0..num_items).map(|item| {
+            let key = LargeKey::try_from(item.to_string().as_str()).unwrap();
+            (key, RecordRow(item))
+        }), false);
+    }
 
-        // Ensure that all insertions and the split were correctly persisted.
-        let btree: BPlusTree<EmailKey> = BPlusTree::load("test-data/string-key").unwrap();
-        emails.iter().enumerate().for_each(|(record, &email)| {
-            assert_eq!(btree.lookup(&EmailKey::try_from(email).unwrap()).unwrap(), Some(RecordRow(record)));
-        });
+    /// Tests that when inserting items less than the previous minimum, the tree still functions as expected.
+    /// Since each split stores items greater than or equal to a key, when inserting a new minimum, the tree must
+    /// recurse and update upwards. This test case resembles something of a worst-case scenario for performance because of this.
+    #[test]
+    fn test_minimum_insertion() {
+        let num_items = TreeNode::<usize>::max_splits(); // This will always have 2 levels.
+        test_records("minimum-insertion", (0..num_items).rev().map(|i| (i, RecordRow(i))), false);
     }
 
 }

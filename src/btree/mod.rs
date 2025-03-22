@@ -625,9 +625,11 @@ mod test {
     /// Tests that the B+ Tree correctly handles 3+ layers, particularly the third layer
     /// is the first time a new branch root is created from a split
     #[test]
-    fn test_deep_tree() { // This test is currently failing, and I'm not sure how/why.
-        type LargeKey = StringKey::<512>; // 512 characters in a key is extremely large. Very few splits are supported per page.
-        let num_items = TreeNode::<LargeKey>::max_splits() * TreeNode::<LargeKey>::max_splits(); // Should be less than 64
+    fn test_deep_tree() {
+        // 512 characters in a key is extremely large. Very few splits are supported per page.
+        type LargeKey = StringKey::<512>;
+        // Should be less than 512, guarantees tree size of at least depth 3, on average 4.
+        let num_items = TreeNode::<LargeKey>::max_splits().pow(3);
 
         test_records("deep-tree", (0..num_items).map(|item| {
             let key = LargeKey::try_from(item.to_string().as_str()).unwrap();
